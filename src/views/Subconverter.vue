@@ -33,6 +33,15 @@
                   <el-option v-for="(v, k) in options.customBackend" :key="k" :label="k" :value="v"></el-option>
                 </el-select>
               </el-form-item>
+              <el-alert
+                  v-if="compatibilityNotice"
+                  :title="compatibilityNotice.title"
+                  :description="compatibilityNotice.description"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  style="margin-bottom: 18px"
+              />
               <el-form-item label="短链选择:">
                 <el-select
                     v-model="form.shortType"
@@ -216,6 +225,7 @@
                     style="width: 120px"
                     type="danger"
                     @click="makeUrl"
+                    :loading="generatingSubscription"
                     :disabled="form.sourceSubUrl.length === 0 || btnBoolean"
                 >生成订阅链接
                 </el-button>
@@ -363,6 +373,13 @@
   </div>
 </template>
 <script>
+import {
+  createCompatibilityNotice,
+  createProbeFailureMessage,
+  looksLikeBrokenSubscription,
+  shouldProbeGeneratedSubscription
+} from "@/utils/backendCompat";
+
 const configScriptBackend = process.env.VUE_APP_CONFIG_UPLOAD_BACKEND + '/api.php'
 const defaultBackend = process.env.VUE_APP_SUBCONVERTER_DEFAULT_BACKEND
 const shortUrlBackend = process.env.VUE_APP_MYURLS_DEFAULT_BACKEND + '/short'
@@ -371,10 +388,12 @@ export default {
   data() {
     return {
       backendVersion: "",
+      compatibilityNotice: null,
       activeName: 'first',
       // 是否为 PC 端
       isPC: true,
       btnBoolean: false,
+      generatingSubscription: false,
       options: {
         clientTypes: {
           Clash: "clash",
@@ -930,18 +949,16 @@ export default {
     onCopy() {
       this.$message.success("已复制");
     },
-    makeUrl() {
-      if (this.form.sourceSubUrl === "" || this.form.clientType === "") {
-        this.$message.error("订阅链接与客户端为必填项");
-        return false;
-      }
-      let backend =
-          this.form.customBackend === ""
-              ? defaultBackend
-              : this.form.customBackend;
+    getActiveBackend() {
+      return this.form.customBackend === ""
+          ? defaultBackend
+          : this.form.customBackend;
+    },
+    buildCustomSubUrl() {
+      let backend = this.getActiveBackend();
       let sourceSub = this.form.sourceSubUrl;
       sourceSub = sourceSub.replace(/(\n|\r|\n\r)/g, "|");
-      this.customSubUrl =
+      let customSubUrl =
           backend +
           "/sub?target=" +
           this.form.clientType +
@@ -950,46 +967,46 @@ export default {
           "&insert=" +
           this.form.insert;
       if (this.form.remoteConfig !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&config=" + encodeURIComponent(this.form.remoteConfig);
       }
       if (this.form.excludeRemarks !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&exclude=" + encodeURIComponent(this.form.excludeRemarks);
       }
       if (this.form.includeRemarks !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&include=" + encodeURIComponent(this.form.includeRemarks);
       }
       if (this.form.filename !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&filename=" + encodeURIComponent(this.form.filename);
       }
       if (this.form.rename !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&rename=" + encodeURIComponent(this.form.rename);
       }
       if (this.form.interval !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&interval=" + encodeURIComponent(this.form.interval * 86400);
       }
       if (this.form.devid !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&dev_id=" + encodeURIComponent(this.form.devid);
       }
       if (this.form.appendType) {
-        this.customSubUrl +=
+        customSubUrl +=
             "&append_type=" + this.form.appendType.toString();
       }
       if (this.form.tls13) {
-        this.customSubUrl +=
+        customSubUrl +=
             "&tls13=" + this.form.tls13.toString();
       }
       if (this.form.sort) {
-        this.customSubUrl +=
+        customSubUrl +=
             "&sort=" + this.form.sort.toString();
       }
-      this.customSubUrl +=
+      customSubUrl +=
           "&emoji=" +
           this.form.emoji.toString() +
           "&list=" +
@@ -1005,27 +1022,77 @@ export default {
           "&scv=" +
           this.form.scv.toString() +
           "&fdn=" +
-          this.form.fdn.toString();    
+          this.form.fdn.toString();
       if (this.form.clientType.includes("surge")) {
         if (this.form.tpl.surge.doh === true) {
-          this.customSubUrl += "&surge.doh=true";
+          customSubUrl += "&surge.doh=true";
         }
       }
       if (this.form.clientType === "clash") {
         if (this.form.tpl.clash.doh === true) {
-          this.customSubUrl += "&clash.doh=true";
+          customSubUrl += "&clash.doh=true";
         }
-        this.customSubUrl += "&new_name=" + this.form.new_name.toString();
+        customSubUrl += "&new_name=" + this.form.new_name.toString();
       }
       if (this.form.clientType === "singbox") {
         if (this.form.tpl.singbox.ipv6 === true) {
-          this.customSubUrl += "&singbox.ipv6=1";
+          customSubUrl += "&singbox.ipv6=1";
         }
       }
       if (this.form.diyua.trim() !== "") {
-        this.customSubUrl +=
+        customSubUrl +=
             "&diyua=" + encodeURIComponent(this.form.diyua);
       }
+      return customSubUrl;
+    },
+    async probeGeneratedSubscription(url) {
+      const response = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+      });
+      const responseText = await response.text();
+
+      return response.ok && !looksLikeBrokenSubscription(responseText);
+    },
+    async makeUrl() {
+      if (this.form.sourceSubUrl === "" || this.form.clientType === "") {
+        this.$message.error("订阅链接与客户端为必填项");
+        return false;
+      }
+      const builtUrl = this.buildCustomSubUrl();
+
+      this.generatingSubscription = true;
+      try {
+        if (shouldProbeGeneratedSubscription(this.form.clientType, this.backendVersion)) {
+          const probeSucceeded = await this.probeGeneratedSubscription(builtUrl);
+
+          if (!probeSucceeded) {
+            this.customSubUrl = "";
+            this.customShortSubUrl = "";
+            await this.$alert(
+                createProbeFailureMessage({
+                  backend: this.getActiveBackend(),
+                  version: this.backendVersion,
+                }),
+                "转换后端不兼容",
+                {
+                  confirmButtonText: "确定",
+                  type: "warning",
+                }
+            );
+            return false;
+          }
+        }
+      } catch (error) {
+        this.$message.warning(
+            "已生成链接，但未能完成后端自检，请手动打开订阅确认返回内容。"
+        );
+      } finally {
+        this.generatingSubscription = false;
+      }
+
+      this.customSubUrl = builtUrl;
+      this.customShortSubUrl = "";
       this.$copyText(this.customSubUrl);
       this.$message.success("定制订阅已复制到剪贴板");
     },
@@ -1284,9 +1351,11 @@ export default {
           .then(res => {
             this.backendVersion = res.data.replace(/backend\n$/gm, "");
             this.backendVersion = this.backendVersion.replace("subconverter", "SubConverter");
+            this.compatibilityNotice = createCompatibilityNotice(this.backendVersion);
             this.$message.success(`后端可用: ${this.backendVersion}`);
           })
           .catch(() => {
+            this.compatibilityNotice = null;
             this.$message.error("后端版本获取失败");
           });
     }
